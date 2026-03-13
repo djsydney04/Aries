@@ -1,104 +1,146 @@
 use crate::model::SupervisorEvent;
 use anyhow::{Context, Result, bail};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+struct TerminalSession {
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+}
+
 pub struct AgentSupervisor {
     tx: Sender<SupervisorEvent>,
-    children: Arc<Mutex<HashMap<String, Arc<Mutex<Child>>>>>,
+    sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
 }
 
 impl AgentSupervisor {
     pub fn new(tx: Sender<SupervisorEvent>) -> Self {
         Self {
             tx,
-            children: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn start(&self, agent_id: &str, argv: Vec<String>, cwd: &Path) -> Result<()> {
-        if argv.is_empty() {
-            bail!("empty command");
+    pub fn start(
+        &self,
+        agent_id: &str,
+        cwd: &Path,
+        initial_command: Option<&str>,
+        size: PtySize,
+    ) -> Result<()> {
+        if self.is_running(agent_id) {
+            bail!("pane {agent_id} is already running");
         }
 
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(size).context("failed to allocate PTY")?;
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn: {}", argv.join(" ")))?;
-        let pid = child.id();
+        let shell = shell_path();
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.arg("-i");
+        cmd.cwd(cwd);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "codex-mux");
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .context("failed to clone PTY reader")?;
+        let writer = pair
+            .master
+            .take_writer()
+            .context("failed to open PTY writer")?;
 
-        let child_ref = Arc::new(Mutex::new(child));
-        self.children
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
+        drop(pair.slave);
+
+        let pid = child.process_id().unwrap_or_default();
+        let killer = child.clone_killer();
+
+        self.sessions
             .lock()
-            .expect("children mutex poisoned")
-            .insert(agent_id.to_string(), Arc::clone(&child_ref));
+            .expect("sessions mutex poisoned")
+            .insert(
+                agent_id.to_string(),
+                TerminalSession {
+                    master: Arc::new(Mutex::new(pair.master)),
+                    writer: Arc::new(Mutex::new(writer)),
+                    killer: Arc::new(Mutex::new(killer)),
+                },
+            );
 
-        if let Some(out) = stdout {
-            Self::spawn_reader(agent_id.to_string(), out, self.tx.clone());
-        }
-        if let Some(err) = stderr {
-            Self::spawn_reader(agent_id.to_string(), err, self.tx.clone());
-        }
-
-        let tx = self.tx.clone();
-        let map = Arc::clone(&self.children);
-        let wait_agent_id = agent_id.to_string();
-        thread::spawn(move || {
-            let code = {
-                let mut child = child_ref.lock().expect("child mutex poisoned");
-                child.wait().ok().and_then(|s| s.code()).unwrap_or(-1)
-            };
-
-            let _ = tx.send(SupervisorEvent::Exited {
-                agent_id: wait_agent_id.clone(),
-                code,
-            });
-
-            map.lock()
-                .expect("children mutex poisoned")
-                .remove(&wait_agent_id);
-        });
+        self.spawn_reader(agent_id.to_string(), reader);
+        self.spawn_waiter(agent_id.to_string(), child);
 
         let _ = self.tx.send(SupervisorEvent::Started {
             agent_id: agent_id.to_string(),
             pid,
         });
 
+        if let Some(command) = initial_command.filter(|command| !command.trim().is_empty()) {
+            let mut bytes = command.as_bytes().to_vec();
+            bytes.push(b'\r');
+            self.send_input(agent_id, &bytes)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn send_input(&self, agent_id: &str, bytes: &[u8]) -> Result<()> {
+        let sessions = self.sessions.lock().expect("sessions mutex poisoned");
+        let session = sessions
+            .get(agent_id)
+            .with_context(|| format!("pane {agent_id} is not running"))?;
+        let mut writer = session.writer.lock().expect("writer mutex poisoned");
+        writer
+            .write_all(bytes)
+            .with_context(|| format!("failed to write to {agent_id}"))?;
+        writer.flush().context("failed to flush PTY writer")?;
+        Ok(())
+    }
+
+    pub fn resize(&self, agent_id: &str, size: PtySize) -> Result<()> {
+        let sessions = self.sessions.lock().expect("sessions mutex poisoned");
+        let session = sessions
+            .get(agent_id)
+            .with_context(|| format!("pane {agent_id} is not running"))?;
+        session
+            .master
+            .lock()
+            .expect("master mutex poisoned")
+            .resize(size)
+            .with_context(|| format!("failed to resize {agent_id}"))?;
         Ok(())
     }
 
     pub fn stop(&self, agent_id: &str) {
-        let maybe_child = self
-            .children
+        let maybe_killer = self
+            .sessions
             .lock()
-            .expect("children mutex poisoned")
+            .expect("sessions mutex poisoned")
             .get(agent_id)
-            .cloned();
+            .map(|session| Arc::clone(&session.killer));
 
-        if let Some(child) = maybe_child {
-            let _ = child.lock().expect("child mutex poisoned").kill();
+        if let Some(killer) = maybe_killer {
+            let _ = killer.lock().expect("killer mutex poisoned").kill();
         }
     }
 
     pub fn stop_all(&self) {
         let ids = self
-            .children
+            .sessions
             .lock()
-            .expect("children mutex poisoned")
+            .expect("sessions mutex poisoned")
             .keys()
             .cloned()
             .collect::<Vec<_>>();
@@ -108,29 +150,23 @@ impl AgentSupervisor {
     }
 
     pub fn is_running(&self, agent_id: &str) -> bool {
-        self.children
+        self.sessions
             .lock()
-            .expect("children mutex poisoned")
+            .expect("sessions mutex poisoned")
             .contains_key(agent_id)
     }
 
-    fn spawn_reader<R: std::io::Read + Send + 'static>(
-        agent_id: String,
-        reader: R,
-        tx: Sender<SupervisorEvent>,
-    ) {
+    fn spawn_reader(&self, agent_id: String, mut reader: Box<dyn Read + Send>) {
+        let tx = self.tx.clone();
         thread::spawn(move || {
-            let mut buf = BufReader::new(reader);
-            let mut line = String::new();
+            let mut buf = [0u8; 8192];
             loop {
-                line.clear();
-                match buf.read_line(&mut line) {
+                match reader.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(_) => {
-                        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
-                        let _ = tx.send(SupervisorEvent::Output {
+                    Ok(len) => {
+                        let _ = tx.send(SupervisorEvent::OutputChunk {
                             agent_id: agent_id.clone(),
-                            line: trimmed,
+                            data: buf[..len].to_vec(),
                         });
                     }
                     Err(_) => break,
@@ -138,4 +174,34 @@ impl AgentSupervisor {
             }
         });
     }
+
+    fn spawn_waiter(
+        &self,
+        agent_id: String,
+        mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    ) {
+        let tx = self.tx.clone();
+        let sessions = Arc::clone(&self.sessions);
+        thread::spawn(move || {
+            let code = child
+                .wait()
+                .ok()
+                .map(|status| status.exit_code() as i32)
+                .unwrap_or(-1);
+
+            sessions
+                .lock()
+                .expect("sessions mutex poisoned")
+                .remove(&agent_id);
+
+            let _ = tx.send(SupervisorEvent::Exited { agent_id, code });
+        });
+    }
+}
+
+fn shell_path() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string())
 }

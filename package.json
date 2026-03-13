@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "cargo build --release --manifest-path Cargo.toml",
+    "release": "node scripts/release.js",
     "test": "cargo test --manifest-path Cargo.toml",
     "postinstall": "node scripts/postinstall.js"
   },

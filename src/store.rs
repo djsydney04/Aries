@@ -134,7 +134,12 @@ mod tests {
         let db_path = dir.path().join("session.db");
         let store = SessionStore::open(&db_path).expect("open store");
 
-        let mut agent = Agent::new("a1".to_string(), "model".to_string(), "prompt".to_string());
+        let mut agent = Agent::new(
+            "a1".to_string(),
+            "model".to_string(),
+            "prompt".to_string(),
+            dir.path().to_path_buf(),
+        );
         agent.status = AgentStatus::Running;
         store.upsert_agent(&agent).expect("upsert");
 

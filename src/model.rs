@@ -1,7 +1,5 @@
-use anyhow::{Result, bail};
 use clap::Parser;
 use rand::Rng;
-use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,9 +26,6 @@ pub struct Args {
 
     #[arg(long, default_value = ".codex_mux/session.db")]
     pub db_path: PathBuf,
-
-    #[arg(long, default_value = "codex --model \"{model}\" \"{prompt}\"")]
-    pub agent_cmd_template: String,
 
     #[arg(long, default_value = "[[NEEDS_HELP]]")]
     pub help_token: String,
@@ -86,40 +81,32 @@ pub struct Agent {
     pub id: String,
     pub model: String,
     pub prompt: String,
+    pub run_dir: PathBuf,
     pub status: AgentStatus,
     pub worktree: Option<WorktreeInfo>,
     pub pid: Option<u32>,
     pub return_code: Option<i32>,
-    pub logs: VecDeque<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub needs_help: bool,
 }
 
 impl Agent {
-    pub fn new(id: String, model: String, prompt: String) -> Self {
+    pub fn new(id: String, model: String, prompt: String, run_dir: PathBuf) -> Self {
         let now = now_ts();
         Self {
             id,
             model,
             prompt,
+            run_dir,
             status: AgentStatus::Starting,
             worktree: None,
             pid: None,
             return_code: None,
-            logs: VecDeque::with_capacity(4000),
             created_at: now,
             updated_at: now,
             needs_help: false,
         }
-    }
-
-    pub fn push_log(&mut self, line: String) {
-        if self.logs.len() >= 4000 {
-            let _ = self.logs.pop_front();
-        }
-        self.logs.push_back(line);
-        self.updated_at = now_ts();
     }
 }
 
@@ -145,7 +132,7 @@ impl Alert {
 #[derive(Debug, Clone)]
 pub enum SupervisorEvent {
     Started { agent_id: String, pid: u32 },
-    Output { agent_id: String, line: String },
+    OutputChunk { agent_id: String, data: Vec<u8> },
     Exited { agent_id: String, code: i32 },
 }
 
@@ -181,30 +168,56 @@ pub fn generate_slug() -> String {
     format!("{adjective}-{animal}-{hex}")
 }
 
-pub fn detect_help_signal(line: &str, help_token: &str) -> bool {
-    let lower = line.to_lowercase();
+pub fn detect_help_signal(text: &str, help_token: &str) -> bool {
+    let lower = text.to_lowercase();
     lower.contains(&help_token.to_lowercase())
         || lower.contains("needs help")
         || lower.contains("need help")
 }
 
-pub fn build_agent_command(
-    template: &str,
-    model: &str,
-    prompt: &str,
-    agent_id: &str,
-    worktree: &str,
-) -> Result<Vec<String>> {
-    let cmd = template
-        .replace("{model}", model)
-        .replace("{prompt}", prompt)
-        .replace("{agent_id}", agent_id)
-        .replace("{worktree}", worktree);
-    let argv = shell_words::split(&cmd)?;
-    if argv.is_empty() {
-        bail!("command template produced empty argv")
+pub fn build_codex_launch_command(model: Option<&str>, prompt: Option<&str>) -> String {
+    let mut argv = vec!["codex".to_string()];
+
+    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+        argv.push("-m".to_string());
+        argv.push(model.to_string());
     }
-    Ok(argv)
+
+    if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        argv.push(prompt.to_string());
+    }
+
+    argv.into_iter()
+        .map(|part| shell_escape(&part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    if value.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'a'..=b'z'
+                | b'A'..=b'Z'
+                | b'0'..=b'9'
+                | b'/'
+                | b'.'
+                | b'-'
+                | b'_'
+                | b':'
+                | b'='
+                | b','
+                | b'+'
+        )
+    }) {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub fn next_agent_id() -> String {
@@ -253,22 +266,27 @@ mod tests {
     }
 
     #[test]
-    fn command_template_build() {
-        let argv = build_agent_command(
-            "codex exec --model \"{model}\" --agent \"{agent_id}\" --cwd \"{worktree}\" \"{prompt}\"",
-            "gpt-x",
-            "hello",
-            "agent-1",
-            "/tmp/w",
-        )
-        .expect("command should build");
+    fn shell_escape_handles_quotes() {
+        assert_eq!(shell_escape("plain-text"), "plain-text");
+        assert_eq!(shell_escape("fix auth bug"), "'fix auth bug'");
+        assert_eq!(shell_escape("it's broken"), "'it'\"'\"'s broken'");
+    }
 
-        assert_eq!(
-            argv,
-            vec![
-                "codex", "exec", "--model", "gpt-x", "--agent", "agent-1", "--cwd", "/tmp/w",
-                "hello",
-            ]
-        );
+    #[test]
+    fn codex_launch_command_builds_model_and_prompt() {
+        let command = build_codex_launch_command(Some("gpt-5"), Some("fix auth bug"));
+        assert_eq!(command, "codex -m gpt-5 'fix auth bug'");
+    }
+
+    #[test]
+    fn codex_launch_command_uses_default_model_when_unspecified() {
+        let command = build_codex_launch_command(None, Some("hello"));
+        assert_eq!(command, "codex hello");
+    }
+
+    #[test]
+    fn codex_launch_command_without_prompt_just_spawns_codex() {
+        let command = build_codex_launch_command(None, None);
+        assert_eq!(command, "codex");
     }
 }

@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+
+# Local app state
+/.codex_mux/
+/.worktrees/
+
+# Node package installs
+/node_modules/
+
+# macOS metadata
+.DS_Store
