@@ -1,6 +1,6 @@
 # codex-mux
 
-Terminal multi-agent Codex supervisor powered by Rust.
+Terminal multi-agent Codex supervisor 
 
 `codex-mux` launches multiple Codex sessions in a TUI grid, keeps each session in its own terminal pane, and can isolate panes in per-agent Git worktrees.
 
